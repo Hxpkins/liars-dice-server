@@ -348,6 +348,36 @@ function startTurnTimer(room) {
     room.turnTimer = setTimeout(function() { executeBotTurn(room); }, 2500 + Math.random() * 2500);
     return;
   }
+  var rp = room.players.find(function(p) { return p.id === cp.id; });
+  if (rp && rp.connected === false) {
+    // Track how many turns they've been disconnected
+    if (!rp.dcTurns) rp.dcTurns = 0;
+    rp.dcTurns++;
+    var waitTime = rp.dcTurns <= 1 ? 30000 : 10000; // 30s first time, 10s after
+    room.turnTimer = setTimeout(function() {
+      var gs2 = room.gameState;
+      if (!gs2 || gs2.phase !== 'bidding') return;
+      var cp2 = gs2.players[gs2.cpi];
+      if (cp2.isBot || cp2.id !== rp.id) return;
+      // Check if they reconnected during wait
+      if (rp.connected) { startTurnTimer(room); return; }
+      // Check for player-set bot strategy
+      var strat = rp.botStrategy || 'auto';
+      if (strat === 'raise1' && gs2.currentBid) {
+        doAction(room, cp2.id, 'bid', { quantity: gs2.currentBid.quantity + 1, faceValue: gs2.currentBid.faceValue });
+      } else if (strat === 'callLiar' && gs2.currentBid) {
+        doAction(room, cp2.id, 'liar', null);
+      } else {
+        // Auto: use bot AI
+        var act = botDecision(gs2, cp2.id, 'regular');
+        doAction(room, cp2.id, act.type, act.bid || null);
+      }
+    }, waitTime);
+    io.to(room.id).emit('playerAfk', { playerId: cp.id, name: rp.name, seconds: Math.round(waitTime / 1000) });
+    return;
+  }
+  // Connected human — normal 30s timer
+  if (rp) rp.dcTurns = 0;
   room.turnTimer = setTimeout(function() {
     var gs2 = room.gameState;
     if (!gs2 || gs2.phase !== 'bidding') return;
@@ -684,25 +714,38 @@ io.on('connection', function(socket) {
     var room = rooms.get(info.roomId);
     if (!room || room.host !== info.playerId) return;
     var targetId = data.playerId;
-    if (targetId === info.playerId) return; // Can't kick yourself
+    if (targetId === info.playerId) return;
     var target = room.players.find(function(p) { return p.id === targetId; });
     if (!target) return;
+    var reason = data.reason || 'Removed by host';
     if (target.isBot) {
-      // Just remove bots
       room.players = room.players.filter(function(p) { return p.id !== targetId; });
     } else {
-      // Kick human player
       if (target.socketId) {
         var tSock = io.sockets.sockets.get(target.socketId);
         if (tSock) {
-          tSock.emit('kicked', { reason: 'Host removed you from the lobby.' });
+          tSock.emit('kicked', { reason: reason });
           tSock.leave(room.id);
         }
         players.delete(target.socketId);
       }
       room.players = room.players.filter(function(p) { return p.id !== targetId; });
     }
+    io.to(room.id).emit('playerKicked', { name: target.name, reason: reason });
     emitLobby(room);
+  });
+
+  socket.on('setBotStrategy', function(data) {
+    var info = players.get(socket.id);
+    if (!info || !data) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    if (!p) return;
+    var valid = ['auto', 'raise1', 'callLiar'];
+    p.botStrategy = valid.includes(data.strategy) ? data.strategy : 'auto';
+    var sock2 = io.sockets.sockets.get(p.socketId);
+    if (sock2) sock2.emit('strategySet', { strategy: p.botStrategy });
   });
 
   socket.on('endCurrentGame', function() {
@@ -1024,14 +1067,8 @@ io.on('connection', function(socket) {
       emitLobby(room);
       var gs = room.gameState;
       if (gs && gs.phase === 'bidding' && gs.players[gs.cpi].id === info.playerId) {
-        clearTimeout(room.turnTimer);
-        var pid = info.playerId;
-        room.turnTimer = setTimeout(function() {
-          var gs2 = room.gameState;
-          if (!gs2 || gs2.phase !== 'bidding') return;
-          if (gs2.currentBid) doAction(room, pid, 'liar', null);
-          else doAction(room, pid, 'bid', { quantity: 1, faceValue: 2 });
-        }, 10000);
+        // Their turn — startTurnTimer handles the tiered disconnect timing
+        startTurnTimer(room);
       }
     }
     if (room.status === 'finished') {
@@ -1043,16 +1080,26 @@ io.on('connection', function(socket) {
 
   socket.on('rejoin', function(data) {
     var room = rooms.get(data.roomId);
-    if (!room) { socket.emit('actionError', 'Room not found.'); return; }
+    if (!room) { socket.emit('rejoinFailed', 'Room no longer exists.'); return; }
     var p = room.players.find(function(pl) { return pl.id === data.playerId; });
-    if (!p) { socket.emit('actionError', 'Player not found.'); return; }
+    if (!p) { socket.emit('rejoinFailed', 'Player not found in room.'); return; }
+    if (p.connected) { socket.emit('rejoinFailed', 'Already connected.'); return; }
     p.socketId = socket.id;
     p.connected = true;
+    p.dcTurns = 0;
     players.set(socket.id, { roomId: data.roomId, playerId: data.playerId });
     socket.join(data.roomId);
+    io.to(room.id).emit('playerRejoined', { name: p.name, avatar: p.avatar, playerId: data.playerId });
     socket.emit('rejoined', { roomId: data.roomId, code: room.code, playerId: data.playerId });
     emitLobby(room);
-    if (room.status === 'playing') emitGameState(room);
+    if (room.status === 'playing') {
+      emitGameState(room);
+      // If it's their turn, cancel bot timer and give them the full 30s
+      var gs = room.gameState;
+      if (gs && gs.phase === 'bidding' && gs.players[gs.cpi].id === data.playerId) {
+        startTurnTimer(room);
+      }
+    }
   });
 });
 
