@@ -3,484 +3,794 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { v4: uuid } = require('uuid');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 const server = http.createServer(app);
 const io = new Server(server, {
-cors: { origin: '*', methods: ['GET', 'POST'] }
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 });
+
 const PORT = process.env.PORT || 3001;
+
+// ============================================================
 // GAME ENGINE
+// ============================================================
 function randomDie() { return Math.floor(Math.random() * 6) + 1; }
 function rollNDice(n) { return Array.from({ length: n }, () => randomDie()); }
+
 function countDice(players, fv, isPal) {
-let c = 0;
-for (const p of players) {
-if (p.isEliminated) continue;
-for (const d of p.dice) {
-if (d === fv) c++;
-else if (!isPal && fv !== 1 && d === 1) c++;
+  let c = 0;
+  for (const p of players) {
+    if (p.isEliminated) continue;
+    for (const d of p.dice) {
+      if (d === fv) c++;
+      else if (!isPal && fv !== 1 && d === 1) c++;
+    }
+  }
+  return c;
 }
-}
-return c;
-}
+
 function actives(s) { return s.players.filter(p => !p.isEliminated); }
 function totalDice(s) { return actives(s).reduce((a, p) => a + p.diceCount, 0); }
+
 function nextActive(s, from) {
-const n = s.players.length;
-let i = (from + 1) % n;
-let x = 0;
-while (s.players[i].isEliminated && x < n) { i = (i + 1) % n; x++; }
-return i;
+  const n = s.players.length;
+  let i = (from + 1) % n;
+  let x = 0;
+  while (s.players[i].isEliminated && x < n) { i = (i + 1) % n; x++; }
+  return i;
 }
+
 function isValidBid(s, b) {
-if (b.faceValue < 1 || b.faceValue > 6) return { ok: false, r: 'Face 1-6' };
-if (b.quantity < 1) return { ok: false, r: 'Qty >= 1' };
-if (b.quantity > totalDice(s)) return { ok: false, r: 'Exceeds dice' };
-const cb = s.currentBid;
-if (!cb) return { ok: true };
-if (s.isPal) {
-if (b.faceValue !== cb.faceValue) return { ok: false, r: 'Palafico: same face' };
-if (b.quantity <= cb.quantity) return { ok: false, r: 'Palafico: raise qty' };
-return { ok: true };
+  if (b.faceValue < 1 || b.faceValue > 6) return { ok: false, r: 'Face 1-6' };
+  if (b.quantity < 1) return { ok: false, r: 'Qty >= 1' };
+  if (b.quantity > totalDice(s)) return { ok: false, r: 'Exceeds dice' };
+  const cb = s.currentBid;
+  if (!cb) return { ok: true };
+  if (s.isPal) {
+    if (b.faceValue !== cb.faceValue) return { ok: false, r: 'Palafico: same face' };
+    if (b.quantity <= cb.quantity) return { ok: false, r: 'Palafico: raise qty' };
+    return { ok: true };
+  }
+  const pa = cb.faceValue === 1, na = b.faceValue === 1;
+  if (pa && na) return b.quantity > cb.quantity ? { ok: true } : { ok: false, r: 'Raise ace qty' };
+  if (!pa && !na) {
+    if (b.quantity > cb.quantity) return { ok: true };
+    if (b.quantity === cb.quantity && b.faceValue > cb.faceValue) return { ok: true };
+    return { ok: false, r: 'Raise qty or face' };
+  }
+  if (!pa && na) { const m = Math.ceil(cb.quantity / 2); return b.quantity >= m ? { ok: true } : { ok: false, r: 'To aces: need ' + m }; }
+  if (pa && !na) { const m = cb.quantity * 2 + 1; return b.quantity >= m ? { ok: true } : { ok: false, r: 'From aces: need ' + m }; }
+  return { ok: true };
 }
-const pa = cb.faceValue === 1, na = b.faceValue === 1;
-if (pa && na) return b.quantity > cb.quantity ? { ok: true } : { ok: false, r: 'Raise ace qty' };
-if (!pa && !na) {
-if (b.quantity > cb.quantity) return { ok: true };
-if (b.quantity === cb.quantity && b.faceValue > cb.faceValue) return { ok: true };
-return { ok: false, r: 'Raise qty or face' };
-}
-if (!pa && na) { const m = Math.ceil(cb.quantity / 2); return b.quantity >= m ? { ok: true } : { ok: false, r: 'To aces: need ' + m }; }
-if (pa && !na) { const m = cb.quantity * 2 + 1; return b.quantity >= m ? { ok: true } : { ok: false, r: 'From aces: need ' + m }; }
-return { ok: true };
-}
+
+// ============================================================
 // BOT AI
+// ============================================================
 function countOwn(dice, face, isPal) {
-let c = 0;
-for (const d of dice) { if (d === face) c++; else if (!isPal && face !== 1 && d === 1) c++; }
-return c;
+  let c = 0;
+  for (const d of dice) { if (d === face) c++; else if (!isPal && face !== 1 && d === 1) c++; }
+  return c;
 }
+
 function botDecision(s, botId) {
-const bot = s.players.find(function(p) { return p.id === botId; });
-const cb = s.currentBid;
-const td = totalDice(s);
-const faces = s.isPal && cb ? [cb.faceValue] : [1, 2, 3, 4, 5, 6];
-const vb = [];
-for (const f of faces) {
-for (let q = 1; q <= td; q++) {
-const b = { playerId: botId, quantity: q, faceValue: f };
-if (isValidBid(s, b).ok) vb.push(b);
+  const bot = s.players.find(function(p) { return p.id === botId; });
+  const cb = s.currentBid;
+  const td = totalDice(s);
+  const faces = s.isPal && cb ? [cb.faceValue] : [1, 2, 3, 4, 5, 6];
+  const vb = [];
+  for (const f of faces) {
+    for (let q = 1; q <= td; q++) {
+      const b = { playerId: botId, quantity: q, faceValue: f };
+      if (isValidBid(s, b).ok) vb.push(b);
+    }
+  }
+  if (!cb && vb.length > 0) {
+    const counts = {};
+    for (let f = 1; f <= 6; f++) counts[f] = countOwn(bot.dice, f, s.isPal);
+    const best = Object.entries(counts).sort(function(a, b) { return b[1] - a[1]; })[0];
+    const qty = Math.max(1, Math.min(Math.floor(td / 6) + 1, td));
+    return { type: 'bid', bid: vb.find(function(b) { return b.faceValue === Number(best[0]) && b.quantity <= qty; }) || vb[0] };
+  }
+  if (vb.length === 0) return { type: 'liar' };
+  if (cb) {
+    const my = countOwn(bot.dice, cb.faceValue, s.isPal);
+    const od = td - bot.diceCount;
+    const prob = s.isPal || cb.faceValue === 1 ? 1 / 6 : 2 / 6;
+    const exp = my + od * prob;
+    if (cb.quantity > exp * 1.3) return { type: 'liar' };
+    if (s.config.mode === 'advanced' && !s.history.some(function(a) { return a.type === 'calza'; }) && cb.playerId !== botId && Math.abs(cb.quantity - exp) < 0.8) {
+      return { type: 'calza' };
+    }
+  }
+  const sorted = vb.slice().sort(function(a, b) {
+    const ao = countOwn(bot.dice, a.faceValue, s.isPal);
+    const bo = countOwn(bot.dice, b.faceValue, s.isPal);
+    return bo !== ao ? bo - ao : a.quantity - b.quantity;
+  });
+  const top = sorted.slice(0, 3);
+  return { type: 'bid', bid: top[Math.floor(Math.random() * top.length)] };
 }
-}
-if (!cb && vb.length > 0) {
-const counts = {};
-for (let f = 1; f <= 6; f++) counts[f] = countOwn(bot.dice, f, s.isPal);
-const best = Object.entries(counts).sort(function(a, b) { return b[1] - a[1]; })[0];
-const qty = Math.max(1, Math.min(Math.floor(td / 6) + 1, td));
-return { type: 'bid', bid: vb.find(function(b) { return b.faceValue === Number(best[0]) && b.quantity <= qty; }) || vb[0] };
-}
-if (vb.length === 0) return { type: 'liar' };
-if (cb) {
-const my = countOwn(bot.dice, cb.faceValue, s.isPal);
-const od = td - bot.diceCount;
-const prob = s.isPal || cb.faceValue === 1 ? 1 / 6 : 2 / 6;
-const exp = my + od * prob;
-if (cb.quantity > exp * 1.3) return { type: 'liar' };
-if (s.config.mode === 'advanced' && !s.history.some(function(a) { return a.type === 'calza'; }) && cb.playerId !== botId && Math.abs(cb.quantity - exp) < 0.8) {
-return { type: 'calza' };
-}
-}
-const sorted = vb.slice().sort(function(a, b) {
-const ao = countOwn(bot.dice, a.faceValue, s.isPal);
-const bo = countOwn(bot.dice, b.faceValue, s.isPal);
-return bo !== ao ? bo - ao : a.quantity - b.quantity;
-});
-const top = sorted.slice(0, 3);
-return { type: 'bid', bid: top[Math.floor(Math.random() * top.length)] };
-}
-// LOBBY SYSTEM
+
+// ============================================================
+// LOBBY, PARTY & MATCHMAKING
+// ============================================================
 const BOT_NAMES = ['Bluff King', 'Lady Luck', 'The Shark', 'Wild Card', 'Snake Eyes'];
 const BOT_AVATARS = ['🤴', '🎭', '🦈', '🃏', '🐍'];
 const rooms = new Map();
 const players = new Map();
-function genCode() {
-const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-let code = '';
-for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-return code;
+const parties = new Map();
+const matchQueue = [];
+
+let botCounter = 0;
+function genCode(len) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < (len || 6); i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
 }
-function createRoom(hostSocket, hostName, hostAvatar, mode) {
-const roomId = uuid();
-const code = genCode();
-const hostId = uuid();
-const room = {
-id: roomId, code: code, mode: mode || 'basic', host: hostId, status: 'lobby',
-maxPlayers: 6,
-players: [{
-id: hostId, socketId: hostSocket.id, name: hostName || 'Host',
-avatar: hostAvatar || '😎', isBot: false, isReady: false, connected: true,
-}],
-gameState: null, turnTimer: null, createdAt: Date.now(),
-};
-rooms.set(roomId, room);
-players.set(hostSocket.id, { roomId: roomId, playerId: hostId });
-hostSocket.join(roomId);
-return room;
+
+function createBotPlayer() {
+  const idx = botCounter % BOT_NAMES.length;
+  botCounter++;
+  return {
+    id: 'bot-' + uuid().slice(0, 8),
+    socketId: null,
+    name: BOT_NAMES[idx],
+    avatar: BOT_AVATARS[idx],
+    isBot: true,
+    isReady: true,
+    connected: true,
+  };
 }
-function addBots(room) {
-const needed = room.maxPlayers - room.players.length;
-for (let i = 0; i < needed; i++) {
-room.players.push({
-id: 'bot-' + i, socketId: null, name: BOT_NAMES[i % BOT_NAMES.length],
-avatar: BOT_AVATARS[i % BOT_AVATARS.length], isBot: true, isReady: true, connected: true,
-});
+
+function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic) {
+  const roomId = uuid();
+  const code = genCode(6);
+  const hostId = uuid();
+  const room = {
+    id: roomId, code: code, mode: mode || 'basic', host: hostId,
+    status: 'lobby', maxPlayers: Math.max(2, Math.min(6, maxPlayers || 6)),
+    isPublic: !!isPublic,
+    players: [{
+      id: hostId, socketId: hostSocket.id, name: hostName || 'Host',
+      avatar: hostAvatar || '😎', isBot: false, isReady: false, connected: true,
+    }],
+    gameState: null, turnTimer: null, createdAt: Date.now(),
+  };
+  rooms.set(roomId, room);
+  players.set(hostSocket.id, { roomId: roomId, playerId: hostId });
+  hostSocket.join(roomId);
+  return room;
 }
+
+function sanitizeForPlayer(gs, playerId) {
+  if (!gs) return null;
+  return {
+    config: gs.config, cpi: gs.cpi, currentBid: gs.currentBid,
+    round: gs.round, phase: gs.phase, isPal: gs.isPal,
+    palId: gs.palId, history: gs.history, result: gs.result,
+    winner: gs.winner,
+    players: gs.players.map(function(p) {
+      return {
+        id: p.id, name: p.name, avatar: p.avatar, diceCount: p.diceCount,
+        isBot: p.isBot, isEliminated: p.isEliminated,
+        dice: p.id === playerId ? p.dice : [],
+      };
+    }),
+  };
 }
-function sanitizeForPlayer(gameState, playerId) {
-if (!gameState) return null;
-return {
-config: gameState.config, cpi: gameState.cpi, currentBid: gameState.currentBid,
-round: gameState.round, phase: gameState.phase, isPal: gameState.isPal,
-palId: gameState.palId, history: gameState.history, result: gameState.result,
-winner: gameState.winner,
-players: gameState.players.map(function(p) {
-return {
-id: p.id, name: p.name, avatar: p.avatar, diceCount: p.diceCount,
-isBot: p.isBot, isEliminated: p.isEliminated,
-dice: p.id === playerId ? p.dice : [],
-};
-}),
-};
+
+function sanitizeRevealed(gs) {
+  return {
+    config: gs.config, cpi: gs.cpi, currentBid: gs.currentBid,
+    round: gs.round, phase: gs.phase, isPal: gs.isPal,
+    palId: gs.palId, history: gs.history, result: gs.result,
+    winner: gs.winner,
+    players: gs.players.map(function(p) {
+      return {
+        id: p.id, name: p.name, avatar: p.avatar, diceCount: p.diceCount,
+        isBot: p.isBot, isEliminated: p.isEliminated, dice: p.dice,
+      };
+    }),
+  };
 }
-function sanitizeRevealed(gameState) {
-return {
-config: gameState.config, cpi: gameState.cpi, currentBid: gameState.currentBid,
-round: gameState.round, phase: gameState.phase, isPal: gameState.isPal,
-palId: gameState.palId, history: gameState.history, result: gameState.result,
-winner: gameState.winner,
-players: gameState.players.map(function(p) {
-return {
-id: p.id, name: p.name, avatar: p.avatar, diceCount: p.diceCount,
-isBot: p.isBot, isEliminated: p.isEliminated, dice: p.dice,
-};
-}),
-};
-}
+
 function emitGameState(room) {
-var gs = room.gameState;
-if (!gs) return;
-room.players.forEach(function(p) {
-if (!p.isBot && p.socketId) {
-var sock = io.sockets.sockets.get(p.socketId);
-if (sock) {
-var view = gs.phase === 'revealing' ? sanitizeRevealed(gs) : sanitizeForPlayer(gs, p.id);
-sock.emit('gameState', view);
+  var gs = room.gameState;
+  if (!gs) return;
+  room.players.forEach(function(p) {
+    if (!p.isBot && p.socketId) {
+      var sock = io.sockets.sockets.get(p.socketId);
+      if (sock) {
+        var view = gs.phase === 'revealing' ? sanitizeRevealed(gs) : sanitizeForPlayer(gs, p.id);
+        sock.emit('gameState', view);
+      }
+    }
+  });
 }
-}
-});
-}
+
 function emitLobby(room) {
-io.to(room.id).emit('lobbyUpdate', {
-id: room.id, code: room.code, mode: room.mode, host: room.host, status: room.status,
-players: room.players.map(function(p) {
-return { id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isReady: p.isReady, connected: p.connected };
-}),
-});
+  io.to(room.id).emit('lobbyUpdate', {
+    id: room.id, code: room.code, mode: room.mode, host: room.host,
+    status: room.status, maxPlayers: room.maxPlayers, isPublic: room.isPublic,
+    players: room.players.map(function(p) {
+      return { id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isReady: p.isReady, connected: p.connected };
+    }),
+  });
 }
+
+// ============================================================
+// GAME FLOW
+// ============================================================
 function startRoundServer(s, fpi) {
-var ns = {
-config: s.config, players: s.players, cpi: fpi, currentBid: null,
-round: s.round + 1, phase: 'bidding', isPal: false, palId: null,
-history: [], result: null, winner: null,
-};
-ns.players = s.players.map(function(p) {
-if (p.isEliminated) return Object.assign({}, p);
-return Object.assign({}, p, { dice: rollNDice(p.diceCount) });
-});
-if (ns.config.mode === 'advanced') {
-var ap = actives(ns);
-var pp = ap.filter(function(p) { return p.diceCount === 1; });
-ns.isPal = pp.length === 1 && ap.length > 2;
-ns.palId = ns.isPal ? pp[0].id : null;
+  var ns = {
+    config: s.config, players: s.players, cpi: fpi, currentBid: null,
+    round: s.round + 1, phase: 'bidding', isPal: false, palId: null,
+    history: [], result: null, winner: null,
+  };
+  ns.players = s.players.map(function(p) {
+    if (p.isEliminated) return Object.assign({}, p);
+    return Object.assign({}, p, { dice: rollNDice(p.diceCount) });
+  });
+  if (ns.config.mode === 'advanced') {
+    var ap = actives(ns);
+    var pp = ap.filter(function(p) { return p.diceCount === 1; });
+    ns.isPal = pp.length === 1 && ap.length > 2;
+    ns.palId = ns.isPal ? pp[0].id : null;
+  }
+  return ns;
 }
-return ns;
-}
+
 function startTurnTimer(room) {
-clearTimeout(room.turnTimer);
-var gs = room.gameState;
-if (!gs || gs.phase !== 'bidding') return;
-var cp = gs.players[gs.cpi];
-if (cp.isBot) {
-room.turnTimer = setTimeout(function() { executeBotTurn(room); }, 2500 + Math.random() * 2500);
-return;
+  clearTimeout(room.turnTimer);
+  var gs = room.gameState;
+  if (!gs || gs.phase !== 'bidding') return;
+  var cp = gs.players[gs.cpi];
+  if (cp.isBot) {
+    room.turnTimer = setTimeout(function() { executeBotTurn(room); }, 2500 + Math.random() * 2500);
+    return;
+  }
+  room.turnTimer = setTimeout(function() {
+    var gs2 = room.gameState;
+    if (!gs2 || gs2.phase !== 'bidding') return;
+    var cp2 = gs2.players[gs2.cpi];
+    if (cp2.isBot) return;
+    if (gs2.currentBid) { doAction(room, cp2.id, 'liar', null); }
+    else { doAction(room, cp2.id, 'bid', { quantity: 1, faceValue: 2 }); }
+  }, 30000);
 }
-room.turnTimer = setTimeout(function() {
-var gs2 = room.gameState;
-if (!gs2 || gs2.phase !== 'bidding') return;
-var cp2 = gs2.players[gs2.cpi];
-if (cp2.isBot) return;
-if (gs2.currentBid) { doAction(room, cp2.id, 'liar', null); }
-else { doAction(room, cp2.id, 'bid', { quantity: 1, faceValue: 2 }); }
-}, 30000);
-}
+
 function executeBotTurn(room) {
-var gs = room.gameState;
-if (!gs || gs.phase !== 'bidding') return;
-var bot = gs.players[gs.cpi];
-if (!bot.isBot) return;
-var act = botDecision(gs, bot.id);
-doAction(room, bot.id, act.type, act.bid || null);
+  var gs = room.gameState;
+  if (!gs || gs.phase !== 'bidding') return;
+  var bot = gs.players[gs.cpi];
+  if (!bot.isBot) return;
+  var act = botDecision(gs, bot.id);
+  doAction(room, bot.id, act.type, act.bid || null);
 }
+
 function doAction(room, playerId, action, data) {
-var gs = room.gameState;
-if (!gs || gs.phase !== 'bidding') return;
-if (gs.players[gs.cpi].id !== playerId) return;
-try {
-if (action === 'bid') {
-var b = { playerId: playerId, quantity: data.quantity, faceValue: data.faceValue };
-var v = isValidBid(gs, b);
-if (!v.ok) {
-var pl = room.players.find(function(p) { return p.id === playerId; });
-if (pl && pl.socketId) {
-var sock = io.sockets.sockets.get(pl.socketId);
-if (sock) sock.emit('actionError', v.r);
+  var gs = room.gameState;
+  if (!gs || gs.phase !== 'bidding') return;
+  if (gs.players[gs.cpi].id !== playerId) return;
+  try {
+    if (action === 'bid') {
+      var b = { playerId: playerId, quantity: data.quantity, faceValue: data.faceValue };
+      var v = isValidBid(gs, b);
+      if (!v.ok) {
+        var pl = room.players.find(function(p) { return p.id === playerId; });
+        if (pl && pl.socketId) {
+          var sock = io.sockets.sockets.get(pl.socketId);
+          if (sock) sock.emit('actionError', v.r);
+        }
+        return;
+      }
+      gs = Object.assign({}, gs, {
+        currentBid: b,
+        history: gs.history.concat([{ type: 'bid', pid: playerId, bid: b }]),
+        cpi: nextActive(gs, gs.cpi),
+      });
+      io.to(room.id).emit('action', { type: 'bid', playerId: playerId, bid: b });
+    } else if (action === 'liar') {
+      if (!gs.currentBid) return;
+      var bid = gs.currentBid;
+      var actual = countDice(gs.players, bid.faceValue, gs.isPal);
+      var ok = actual >= bid.quantity;
+      gs = Object.assign({}, gs, {
+        history: gs.history.concat([{ type: 'liar', pid: playerId }]),
+        result: { action: 'liar', cid: playerId, bid: bid, actual: actual, callerRight: !ok, loserId: ok ? playerId : bid.playerId, gainId: null },
+        phase: 'revealing',
+      });
+      io.to(room.id).emit('action', { type: 'liar', playerId: playerId });
+    } else if (action === 'calza') {
+      if (!gs.currentBid) return;
+      var bid2 = gs.currentBid;
+      var actual2 = countDice(gs.players, bid2.faceValue, gs.isPal);
+      var exact = actual2 === bid2.quantity;
+      var cl = gs.players.find(function(p) { return p.id === playerId; });
+      var cg = cl.diceCount < gs.config.maxDice;
+      gs = Object.assign({}, gs, {
+        history: gs.history.concat([{ type: 'calza', pid: playerId }]),
+        result: { action: 'calza', cid: playerId, bid: bid2, actual: actual2, callerRight: exact, loserId: exact ? null : playerId, gainId: exact && cg ? playerId : null },
+        phase: 'revealing',
+      });
+      io.to(room.id).emit('action', { type: 'calza', playerId: playerId });
+    }
+    room.gameState = gs;
+    emitGameState(room);
+    if (gs.phase === 'revealing') {
+      clearTimeout(room.turnTimer);
+      room.turnTimer = setTimeout(function() { resolveReveal(room); }, 6000);
+    } else {
+      startTurnTimer(room);
+    }
+  } catch (e) { console.error('Action error:', e); }
 }
-return;
-}
-gs = Object.assign({}, gs, {
-currentBid: b,
-history: gs.history.concat([{ type: 'bid', pid: playerId, bid: b }]),
-cpi: nextActive(gs, gs.cpi),
-});
-io.to(room.id).emit('action', { type: 'bid', playerId: playerId, bid: b });
-} else if (action === 'liar') {
-if (!gs.currentBid) return;
-var bid = gs.currentBid;
-var actual = countDice(gs.players, bid.faceValue, gs.isPal);
-var ok = actual >= bid.quantity;
-gs = Object.assign({}, gs, {
-history: gs.history.concat([{ type: 'liar', pid: playerId }]),
-result: { action: 'liar', cid: playerId, bid: bid, actual: actual, callerRight: !ok, loserId: ok ? playerId : bid.playerId, gainId: null },
-phase: 'revealing',
-});
-io.to(room.id).emit('action', { type: 'liar', playerId: playerId });
-} else if (action === 'calza') {
-if (!gs.currentBid) return;
-var bid2 = gs.currentBid;
-var actual2 = countDice(gs.players, bid2.faceValue, gs.isPal);
-var exact = actual2 === bid2.quantity;
-var cl = gs.players.find(function(p) { return p.id === playerId; });
-var cg = cl.diceCount < gs.config.maxDice;
-gs = Object.assign({}, gs, {
-history: gs.history.concat([{ type: 'calza', pid: playerId }]),
-result: { action: 'calza', cid: playerId, bid: bid2, actual: actual2, callerRight: exact, loserId: exact ? null : playerId, gainId: exact && cg ? playerId : null },
-phase: 'revealing',
-});
-io.to(room.id).emit('action', { type: 'calza', playerId: playerId });
-}
-room.gameState = gs;
-emitGameState(room);
-if (gs.phase === 'revealing') {
-clearTimeout(room.turnTimer);
-room.turnTimer = setTimeout(function() { resolveReveal(room); }, 6000);
-} else {
-startTurnTimer(room);
-}
-} catch (e) { console.error('Action error:', e); }
-}
+
 function resolveReveal(room) {
-var gs = room.gameState;
-if (!gs || gs.phase !== 'revealing') return;
-var r = gs.result;
-var newPlayers = gs.players.map(function(p) {
-var u = Object.assign({}, p);
-if (r.loserId === p.id) { u.diceCount = Math.max(0, p.diceCount - 1); if (u.diceCount === 0) u.isEliminated = true; }
-if (r.gainId === p.id) u.diceCount = Math.min(gs.config.maxDice, p.diceCount + 1);
-return u;
-});
-gs = Object.assign({}, gs, { players: newPlayers });
-var rem = actives(gs);
-if (rem.length === 1) {
-gs.phase = 'gameOver';
-gs.winner = rem[0].id;
-room.gameState = gs;
-room.status = 'finished';
-emitGameState(room);
-io.to(room.id).emit('gameOver', { winner: rem[0] });
-return;
+  var gs = room.gameState;
+  if (!gs || gs.phase !== 'revealing') return;
+  var r = gs.result;
+  var newPlayers = gs.players.map(function(p) {
+    var u = Object.assign({}, p);
+    if (r.loserId === p.id) { u.diceCount = Math.max(0, p.diceCount - 1); if (u.diceCount === 0) u.isEliminated = true; }
+    if (r.gainId === p.id) u.diceCount = Math.min(gs.config.maxDice, p.diceCount + 1);
+    return u;
+  });
+  gs = Object.assign({}, gs, { players: newPlayers });
+  var rem = actives(gs);
+  if (rem.length === 1) {
+    gs.phase = 'gameOver';
+    gs.winner = rem[0].id;
+    room.gameState = gs;
+    room.status = 'finished';
+    emitGameState(room);
+    io.to(room.id).emit('gameOver', { winner: rem[0] });
+    return;
+  }
+  var ni;
+  if (r.loserId) {
+    var li = gs.players.findIndex(function(p) { return p.id === r.loserId; });
+    ni = gs.players[li].isEliminated ? nextActive(gs, li) : li;
+  } else {
+    ni = gs.players.findIndex(function(p) { return p.id === r.cid; });
+  }
+  room.gameState = startRoundServer(gs, ni);
+  emitGameState(room);
+  startTurnTimer(room);
 }
-var ni;
-if (r.loserId) {
-var li = gs.players.findIndex(function(p) { return p.id === r.loserId; });
-ni = gs.players[li].isEliminated ? nextActive(gs, li) : li;
-} else {
-ni = gs.players.findIndex(function(p) { return p.id === r.cid; });
-}
-room.gameState = startRoundServer(gs, ni);
-emitGameState(room);
-startTurnTimer(room);
-}
+
 function startGame(room) {
-addBots(room);
-room.status = 'playing';
-var defs = room.players.map(function(p) {
-return { id: p.id, name: p.name, isBot: p.isBot, avatar: p.avatar, diceSkin: 'default' };
-});
-var c = { mode: room.mode, startingDice: 5, turnTimer: 30, maxDice: 5, playerCount: defs.length };
-var ps = defs.map(function(p) {
-return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: 'default' };
-});
-room.gameState = { config: c, players: ps, cpi: 0, currentBid: null, round: 0, phase: 'waiting', isPal: false, palId: null, history: [], result: null, winner: null };
-var first = Math.floor(Math.random() * room.players.length);
-room.gameState = startRoundServer(room.gameState, first);
-emitGameState(room);
-startTurnTimer(room);
+  room.status = 'playing';
+  var c = { mode: room.mode, startingDice: 5, turnTimer: 30, maxDice: 5, playerCount: room.players.length };
+  var ps = room.players.map(function(p) {
+    return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: 'default' };
+  });
+  room.gameState = { config: c, players: ps, cpi: 0, currentBid: null, round: 0, phase: 'waiting', isPal: false, palId: null, history: [], result: null, winner: null };
+  var first = Math.floor(Math.random() * room.players.length);
+  room.gameState = startRoundServer(room.gameState, first);
+  emitGameState(room);
+  startTurnTimer(room);
 }
+
+// ============================================================
+// MATCHMAKING
+// ============================================================
+function removeFromQueue(socketId) {
+  for (var i = matchQueue.length - 1; i >= 0; i--) {
+    if (matchQueue[i].socketId === socketId) matchQueue.splice(i, 1);
+    else if (matchQueue[i].partyMembers) {
+      var found = matchQueue[i].partyMembers.some(function(m) { return m.socketId === socketId; });
+      if (found) matchQueue.splice(i, 1);
+    }
+  }
+}
+
+function tryMatchmake() {
+  var byMode = { basic: [], advanced: [] };
+  for (var i = 0; i < matchQueue.length; i++) {
+    var entry = matchQueue[i];
+    var mode = entry.mode || 'basic';
+    if (!byMode[mode]) byMode[mode] = [];
+    byMode[mode].push(entry);
+  }
+  for (var mode in byMode) {
+    var entries = byMode[mode];
+    if (entries.length === 0) continue;
+    var pending = [];
+    var totalPlayers = 0;
+    for (var j = 0; j < entries.length; j++) {
+      var e = entries[j];
+      var size = e.partyMembers ? e.partyMembers.length : 1;
+      if (totalPlayers + size <= 6) { pending.push(e); totalPlayers += size; }
+    }
+    // Need at least 2 human players, OR 1 who has waited 15+ seconds
+    var oldestWait = pending.length > 0 ? Date.now() - pending[0].joinedAt : 0;
+    if (totalPlayers < 2 && oldestWait < 15000) continue;
+    if (totalPlayers < 1) continue;
+
+    var firstEntry = pending[0];
+    var firstSock = io.sockets.sockets.get(firstEntry.socketId);
+    if (!firstSock) { removeFromQueue(firstEntry.socketId); continue; }
+
+    var room = createRoom(firstSock, firstEntry.name, firstEntry.avatar, mode, 6, true);
+    firstSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: room.host });
+
+    for (var k = 1; k < pending.length; k++) {
+      var pe = pending[k];
+      if (pe.partyMembers) {
+        for (var m = 0; m < pe.partyMembers.length; m++) {
+          var mem = pe.partyMembers[m];
+          var memSock = io.sockets.sockets.get(mem.socketId);
+          if (!memSock) continue;
+          var memId = uuid();
+          room.players.push({ id: memId, socketId: mem.socketId, name: mem.name, avatar: mem.avatar, isBot: false, isReady: true, connected: true });
+          players.set(mem.socketId, { roomId: room.id, playerId: memId });
+          memSock.join(room.id);
+          memSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: memId });
+        }
+      } else {
+        var pSock = io.sockets.sockets.get(pe.socketId);
+        if (!pSock) continue;
+        var pid = uuid();
+        room.players.push({ id: pid, socketId: pe.socketId, name: pe.name, avatar: pe.avatar, isBot: false, isReady: true, connected: true });
+        players.set(pe.socketId, { roomId: room.id, playerId: pid });
+        pSock.join(room.id);
+        pSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: pid });
+      }
+    }
+
+    for (var r2 = 0; r2 < pending.length; r2++) {
+      var idx = matchQueue.indexOf(pending[r2]);
+      if (idx !== -1) matchQueue.splice(idx, 1);
+    }
+
+    // Fill with bots and start
+    while (room.players.length < 6) room.players.push(createBotPlayer());
+    setTimeout(function() { startGame(room); emitLobby(room); }, 3000);
+  }
+}
+
+setInterval(tryMatchmake, 3000);
+
+// ============================================================
 // SOCKET HANDLERS
+// ============================================================
 io.on('connection', function(socket) {
-console.log('Connected: ' + socket.id);
-socket.on('createRoom', function(data) {
-var room = createRoom(socket, data.name, data.avatar, data.mode);
-socket.emit('roomCreated', { roomId: room.id, code: room.code, playerId: room.host });
-emitLobby(room);
+  console.log('Connected: ' + socket.id);
+
+  socket.on('createRoom', function(data) {
+    var room = createRoom(socket, data.name, data.avatar, data.mode, data.maxPlayers || 6, false);
+    socket.emit('roomCreated', { roomId: room.id, code: room.code, playerId: room.host, maxPlayers: room.maxPlayers });
+    emitLobby(room);
+  });
+
+  socket.on('joinRoom', function(data) {
+    var found = null;
+    rooms.forEach(function(room) {
+      if (room.code === data.code.toUpperCase() && room.status === 'lobby') found = room;
+    });
+    if (!found) { socket.emit('actionError', 'Room not found or game already started.'); return; }
+    if (found.players.length >= found.maxPlayers) { socket.emit('actionError', 'Room is full (' + found.maxPlayers + '/' + found.maxPlayers + ').'); return; }
+    var playerId = uuid();
+    found.players.push({ id: playerId, socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', isBot: false, isReady: false, connected: true });
+    players.set(socket.id, { roomId: found.id, playerId: playerId });
+    socket.join(found.id);
+    socket.emit('joinedRoom', { roomId: found.id, code: found.code, playerId: playerId });
+    emitLobby(found);
+  });
+
+  socket.on('setMaxPlayers', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby' || room.host !== info.playerId) return;
+    var n = Math.max(2, Math.min(6, data.maxPlayers || 6));
+    while (room.players.length > n) {
+      var botIdx = -1;
+      for (var i = room.players.length - 1; i >= 0; i--) {
+        if (room.players[i].isBot) { botIdx = i; break; }
+      }
+      if (botIdx !== -1) room.players.splice(botIdx, 1);
+      else break;
+    }
+    room.maxPlayers = n;
+    emitLobby(room);
+  });
+
+  socket.on('addBot', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby' || room.host !== info.playerId) return;
+    if (room.players.length >= room.maxPlayers) { socket.emit('actionError', 'Room is full.'); return; }
+    room.players.push(createBotPlayer());
+    emitLobby(room);
+  });
+
+  socket.on('removeBot', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby' || room.host !== info.playerId) return;
+    var botIdx = -1;
+    if (data && data.botId) {
+      botIdx = room.players.findIndex(function(p) { return p.id === data.botId && p.isBot; });
+    } else {
+      for (var i = room.players.length - 1; i >= 0; i--) {
+        if (room.players[i].isBot) { botIdx = i; break; }
+      }
+    }
+    if (botIdx !== -1) { room.players.splice(botIdx, 1); emitLobby(room); }
+  });
+
+  socket.on('toggleReady', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby') return;
+    var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    if (p) { p.isReady = !p.isReady; emitLobby(room); }
+  });
+
+  socket.on('startGame', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby') return;
+    if (room.host !== info.playerId) { socket.emit('actionError', 'Only host can start.'); return; }
+    if (room.players.length < 2) { socket.emit('actionError', 'Need at least 2 players.'); return; }
+    startGame(room);
+    emitLobby(room);
+  });
+
+  // --- MATCHMAKING ---
+  socket.on('searchGame', function(data) {
+    removeFromQueue(socket.id);
+    matchQueue.push({ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', mode: data.mode || 'basic', partyMembers: null, joinedAt: Date.now() });
+    socket.emit('queueJoined', { position: matchQueue.length });
+    tryMatchmake();
+  });
+
+  socket.on('cancelSearch', function() {
+    removeFromQueue(socket.id);
+    socket.emit('queueLeft');
+  });
+
+  // --- PARTY ---
+  socket.on('createParty', function(data) {
+    var partyId = uuid();
+    var code = genCode(4);
+    var party = { id: partyId, code: code, leader: socket.id, members: [{ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲' }] };
+    parties.set(partyId, party);
+    socket.partyId = partyId;
+    socket.emit('partyCreated', { partyId: partyId, code: code });
+    socket.emit('partyUpdate', { id: party.id, code: party.code, leader: party.leader, members: party.members });
+  });
+
+  socket.on('joinParty', function(data) {
+    var found = null;
+    parties.forEach(function(party) { if (party.code === data.code.toUpperCase()) found = party; });
+    if (!found) { socket.emit('actionError', 'Party not found.'); return; }
+    if (found.members.length >= 5) { socket.emit('actionError', 'Party is full (max 5).'); return; }
+    found.members.push({ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲' });
+    socket.partyId = found.id;
+    socket.emit('partyJoined', { partyId: found.id, code: found.code });
+    found.members.forEach(function(m) {
+      var s = io.sockets.sockets.get(m.socketId);
+      if (s) s.emit('partyUpdate', { id: found.id, code: found.code, leader: found.leader, members: found.members });
+    });
+  });
+
+  socket.on('leaveParty', function() {
+    if (!socket.partyId) return;
+    var party = parties.get(socket.partyId);
+    if (!party) return;
+    party.members = party.members.filter(function(m) { return m.socketId !== socket.id; });
+    socket.partyId = null;
+    if (party.members.length === 0) { parties.delete(party.id); return; }
+    if (party.leader === socket.id) party.leader = party.members[0].socketId;
+    party.members.forEach(function(m) {
+      var s = io.sockets.sockets.get(m.socketId);
+      if (s) s.emit('partyUpdate', { id: party.id, code: party.code, leader: party.leader, members: party.members });
+    });
+  });
+
+  socket.on('partySearch', function(data) {
+    if (!socket.partyId) { socket.emit('actionError', 'Not in a party.'); return; }
+    var party = parties.get(socket.partyId);
+    if (!party || party.leader !== socket.id) { socket.emit('actionError', 'Only party leader can search.'); return; }
+    party.members.forEach(function(m) { removeFromQueue(m.socketId); });
+    matchQueue.push({ socketId: socket.id, name: party.members[0].name, avatar: party.members[0].avatar, mode: data.mode || 'basic', partyMembers: party.members.slice(), joinedAt: Date.now() });
+    party.members.forEach(function(m) {
+      var s = io.sockets.sockets.get(m.socketId);
+      if (s) s.emit('queueJoined', { position: matchQueue.length, asParty: true });
+    });
+    tryMatchmake();
+  });
+
+  socket.on('partyCancelSearch', function() {
+    removeFromQueue(socket.id);
+    if (socket.partyId) {
+      var party = parties.get(socket.partyId);
+      if (party) { party.members.forEach(function(m) { var s = io.sockets.sockets.get(m.socketId); if (s) s.emit('queueLeft'); }); }
+    }
+  });
+
+  // --- GAME ACTIONS ---
+  socket.on('bid', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'playing') return;
+    doAction(room, info.playerId, 'bid', data);
+  });
+
+  socket.on('callLiar', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'playing') return;
+    doAction(room, info.playerId, 'liar', null);
+  });
+
+  socket.on('callCalza', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'playing') return;
+    doAction(room, info.playerId, 'calza', null);
+  });
+
+  // --- CHAT ---
+  socket.on('chat', function(msg) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    if (!p) return;
+    io.to(room.id).emit('chat', { sender: p.name, message: msg, avatar: p.avatar });
+  });
+
+  // --- VOICE SIGNALING ---
+  socket.on('voiceOffer', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var target = room.players.find(function(p) { return p.id === data.targetId; });
+    if (target && target.socketId) {
+      var tSock = io.sockets.sockets.get(target.socketId);
+      if (tSock) tSock.emit('voiceOffer', { fromId: info.playerId, offer: data.offer });
+    }
+  });
+
+  socket.on('voiceAnswer', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var target = room.players.find(function(p) { return p.id === data.targetId; });
+    if (target && target.socketId) {
+      var tSock = io.sockets.sockets.get(target.socketId);
+      if (tSock) tSock.emit('voiceAnswer', { fromId: info.playerId, answer: data.answer });
+    }
+  });
+
+  socket.on('voiceIce', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var target = room.players.find(function(p) { return p.id === data.targetId; });
+    if (target && target.socketId) {
+      var tSock = io.sockets.sockets.get(target.socketId);
+      if (tSock) tSock.emit('voiceIce', { fromId: info.playerId, candidate: data.candidate });
+    }
+  });
+
+  socket.on('voiceToggle', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    io.to(info.roomId).emit('voiceToggle', { playerId: info.playerId, muted: data.muted });
+  });
+
+  // --- DISCONNECT ---
+  socket.on('disconnect', function() {
+    console.log('Disconnected: ' + socket.id);
+    removeFromQueue(socket.id);
+    if (socket.partyId) {
+      var party = parties.get(socket.partyId);
+      if (party) {
+        party.members = party.members.filter(function(m) { return m.socketId !== socket.id; });
+        if (party.members.length === 0) parties.delete(party.id);
+        else {
+          if (party.leader === socket.id) party.leader = party.members[0].socketId;
+          party.members.forEach(function(m) {
+            var s = io.sockets.sockets.get(m.socketId);
+            if (s) s.emit('partyUpdate', { id: party.id, code: party.code, leader: party.leader, members: party.members });
+          });
+        }
+      }
+    }
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    if (p) p.connected = false;
+    players.delete(socket.id);
+    if (room.status === 'lobby') {
+      room.players = room.players.filter(function(pl) { return pl.id !== info.playerId; });
+      if (room.players.filter(function(p2) { return !p2.isBot; }).length === 0) { rooms.delete(room.id); return; }
+      if (room.host === info.playerId) {
+        var newHost = room.players.find(function(pl) { return !pl.isBot; });
+        if (newHost) room.host = newHost.id;
+      }
+      emitLobby(room);
+    }
+    if (room.status === 'playing') {
+      emitLobby(room);
+      var gs = room.gameState;
+      if (gs && gs.phase === 'bidding' && gs.players[gs.cpi].id === info.playerId) {
+        clearTimeout(room.turnTimer);
+        var pid = info.playerId;
+        room.turnTimer = setTimeout(function() {
+          var gs2 = room.gameState;
+          if (!gs2 || gs2.phase !== 'bidding') return;
+          if (gs2.currentBid) doAction(room, pid, 'liar', null);
+          else doAction(room, pid, 'bid', { quantity: 1, faceValue: 2 });
+        }, 10000);
+      }
+    }
+  });
+
+  socket.on('rejoin', function(data) {
+    var room = rooms.get(data.roomId);
+    if (!room) { socket.emit('actionError', 'Room not found.'); return; }
+    var p = room.players.find(function(pl) { return pl.id === data.playerId; });
+    if (!p) { socket.emit('actionError', 'Player not found.'); return; }
+    p.socketId = socket.id;
+    p.connected = true;
+    players.set(socket.id, { roomId: data.roomId, playerId: data.playerId });
+    socket.join(data.roomId);
+    socket.emit('rejoined', { roomId: data.roomId, code: room.code, playerId: data.playerId });
+    emitLobby(room);
+    if (room.status === 'playing') emitGameState(room);
+  });
 });
-socket.on('joinRoom', function(data) {
-var found = null;
-rooms.forEach(function(room) {
-if (room.code === data.code.toUpperCase() && room.status === 'lobby') found = room;
-});
-if (!found) { socket.emit('actionError', 'Room not found or game already started.'); return; }
-var humanCount = found.players.filter(function(p) { return !p.isBot; }).length;
-if (humanCount >= found.maxPlayers) { socket.emit('actionError', 'Room is full.'); return; }
-var playerId = uuid();
-found.players.push({
-id: playerId, socketId: socket.id, name: data.name || 'Player',
-avatar: data.avatar || '🎲', isBot: false, isReady: false, connected: true,
-});
-players.set(socket.id, { roomId: found.id, playerId: playerId });
-socket.join(found.id);
-socket.emit('joinedRoom', { roomId: found.id, code: found.code, playerId: playerId });
-emitLobby(found);
-});
-socket.on('toggleReady', function() {
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room || room.status !== 'lobby') return;
-var p = room.players.find(function(pl) { return pl.id === info.playerId; });
-if (p) { p.isReady = !p.isReady; emitLobby(room); }
-});
-socket.on('startGame', function() {
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room || room.status !== 'lobby') return;
-if (room.host !== info.playerId) { socket.emit('actionError', 'Only host can start.'); return; }
-startGame(room);
-});
-socket.on('bid', function(data) {
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room || room.status !== 'playing') return;
-doAction(room, info.playerId, 'bid', data);
-});
-socket.on('callLiar', function() {
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room || room.status !== 'playing') return;
-doAction(room, info.playerId, 'liar', null);
-});
-socket.on('callCalza', function() {
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room || room.status !== 'playing') return;
-doAction(room, info.playerId, 'calza', null);
-});
-socket.on('chat', function(msg) {
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room) return;
-var p = room.players.find(function(pl) { return pl.id === info.playerId; });
-if (!p) return;
-io.to(room.id).emit('chat', { sender: p.name, message: msg, avatar: p.avatar });
-});
-socket.on('disconnect', function() {
-console.log('Disconnected: ' + socket.id);
-var info = players.get(socket.id);
-if (!info) return;
-var room = rooms.get(info.roomId);
-if (!room) return;
-var p = room.players.find(function(pl) { return pl.id === info.playerId; });
-if (p) p.connected = false;
-players.delete(socket.id);
-if (room.status === 'lobby') {
-room.players = room.players.filter(function(pl) { return pl.id !== info.playerId; });
-if (room.players.length === 0) { rooms.delete(room.id); return; }
-if (room.host === info.playerId) {
-var newHost = room.players.find(function(pl) { return !pl.isBot; });
-if (newHost) room.host = newHost.id;
-}
-emitLobby(room);
-}
-if (room.status === 'playing') {
-emitLobby(room);
-var gs = room.gameState;
-if (gs && gs.phase === 'bidding' && gs.players[gs.cpi].id === info.playerId) {
-clearTimeout(room.turnTimer);
-var pid = info.playerId;
-room.turnTimer = setTimeout(function() {
-var gs2 = room.gameState;
-if (!gs2 || gs2.phase !== 'bidding') return;
-if (gs2.currentBid) doAction(room, pid, 'liar', null);
-else doAction(room, pid, 'bid', { quantity: 1, faceValue: 2 });
-}, 10000);
-}
-}
-});
-socket.on('rejoin', function(data) {
-var room = rooms.get(data.roomId);
-if (!room) { socket.emit('actionError', 'Room not found.'); return; }
-var p = room.players.find(function(pl) { return pl.id === data.playerId; });
-if (!p) { socket.emit('actionError', 'Player not found.'); return; }
-p.socketId = socket.id;
-p.connected = true;
-players.set(socket.id, { roomId: data.roomId, playerId: data.playerId });
-socket.join(data.roomId);
-socket.emit('rejoined', { roomId: data.roomId, code: room.code, playerId: data.playerId });
-emitLobby(room);
-if (room.status === 'playing') emitGameState(room);
-});
-});
+
+// ============================================================
 // REST ENDPOINTS
+// ============================================================
 app.get('/health', function(req, res) {
-res.json({ status: 'ok', rooms: rooms.size, players: players.size });
+  res.json({ status: 'ok', rooms: rooms.size, players: players.size, queue: matchQueue.length, parties: parties.size });
 });
+
 app.get('/rooms', function(req, res) {
-var publicRooms = [];
-rooms.forEach(function(room) {
-if (room.status === 'lobby') {
-publicRooms.push({
-code: room.code, mode: room.mode,
-playerCount: room.players.filter(function(p) { return !p.isBot; }).length,
-maxPlayers: room.maxPlayers,
+  var publicRooms = [];
+  rooms.forEach(function(room) {
+    if (room.status === 'lobby' && room.isPublic) {
+      publicRooms.push({ code: room.code, mode: room.mode, playerCount: room.players.filter(function(p) { return !p.isBot; }).length, maxPlayers: room.maxPlayers });
+    }
+  });
+  res.json(publicRooms);
 });
-}
-});
-res.json(publicRooms);
-});
-// Cleanup stale rooms every 5 minutes
+
 setInterval(function() {
-var now = Date.now();
-rooms.forEach(function(room, id) {
-if (now - room.createdAt > 60 * 60 * 1000) rooms.delete(id);
-});
+  var now = Date.now();
+  rooms.forEach(function(room, id) { if (now - room.createdAt > 60 * 60 * 1000) rooms.delete(id); });
+  parties.forEach(function(party, id) { if (party.members.length === 0) parties.delete(id); });
+  for (var i = matchQueue.length - 1; i >= 0; i--) {
+    if (now - matchQueue[i].joinedAt > 5 * 60 * 1000) matchQueue.splice(i, 1);
+  }
 }, 5 * 60 * 1000);
+
 server.listen(PORT, function() {
-console.log('Liars Dice server running on port ' + PORT);
+  console.log('Liars Dice server v2 running on port ' + PORT);
 });
