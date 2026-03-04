@@ -76,43 +76,136 @@ function countOwn(dice, face, isPal) {
   return c;
 }
 
-function botDecision(s, botId) {
-  const bot = s.players.find(function(p) { return p.id === botId; });
-  const cb = s.currentBid;
-  const td = totalDice(s);
-  const faces = s.isPal && cb ? [cb.faceValue] : [1, 2, 3, 4, 5, 6];
-  const vb = [];
-  for (const f of faces) {
-    for (let q = 1; q <= td; q++) {
-      const b = { playerId: botId, quantity: q, faceValue: f };
+// --- STATISTICAL BOT AI ---
+function logBinom(n, k) {
+  if (k === 0 || k === n) return 0;
+  var r = 0;
+  for (var i = 0; i < k; i++) r += Math.log(n - i) - Math.log(i + 1);
+  return r;
+}
+function binomProb(n, k, p) {
+  // P(X >= k) where X ~ Binomial(n, p)
+  if (k <= 0) return 1;
+  if (k > n) return 0;
+  if (p <= 0) return 0;
+  if (p >= 1) return 1;
+  var sum = 0;
+  for (var i = 0; i < k; i++) {
+    sum += Math.exp(logBinom(n, i) + i * Math.log(p) + (n - i) * Math.log(1 - p));
+  }
+  return Math.max(0, Math.min(1, 1 - sum));
+}
+function bidProb(s, bid, botDice, isPal) {
+  var myMatch = countOwn(botDice, bid.faceValue, isPal);
+  var needed = bid.quantity - myMatch;
+  if (needed <= 0) return 1;
+  var unknown = totalDice(s) - botDice.length;
+  var p = (isPal || bid.faceValue === 1) ? 1/6 : 2/6;
+  return binomProb(unknown, needed, p);
+}
+
+// Difficulty configs: liarThresh = call liar if P(bid true) < this
+// bidNoise = how much randomness in bid selection (0=optimal, 1=random)
+// calzaRange = how close to exact probability must be to attempt calza
+// bluffChance = chance to overbid beyond statistical safety
+var DIFF_CFG = {
+  rookie:  { liarThresh: 0.20, bidNoise: 0.7, calzaRange: 0,    bluffChance: 0.3  },
+  regular: { liarThresh: 0.35, bidNoise: 0.4, calzaRange: 0,    bluffChance: 0.15 },
+  skilled: { liarThresh: 0.45, bidNoise: 0.2, calzaRange: 0.12, bluffChance: 0.08 },
+  expert:  { liarThresh: 0.52, bidNoise: 0.05,calzaRange: 0.08, bluffChance: 0.03 },
+};
+
+function botDecision(s, botId, difficulty) {
+  var diff = DIFF_CFG[difficulty] || DIFF_CFG.regular;
+  var bot = s.players.find(function(p) { return p.id === botId; });
+  if (!bot) return { type: 'liar' };
+  var cb = s.currentBid;
+  var td = totalDice(s);
+  var faces = s.isPal && cb ? [cb.faceValue] : [1, 2, 3, 4, 5, 6];
+
+  // Generate valid bids
+  var vb = [];
+  for (var fi = 0; fi < faces.length; fi++) {
+    for (var q = 1; q <= td; q++) {
+      var b = { playerId: botId, quantity: q, faceValue: faces[fi] };
       if (isValidBid(s, b).ok) vb.push(b);
     }
   }
+
+  // Opening bid (no current bid)
   if (!cb && vb.length > 0) {
-    const counts = {};
-    for (let f = 1; f <= 6; f++) counts[f] = countOwn(bot.dice, f, s.isPal);
-    const best = Object.entries(counts).sort(function(a, b) { return b[1] - a[1]; })[0];
-    const qty = Math.max(1, Math.min(Math.floor(td / 6) + 1, td));
-    return { type: 'bid', bid: vb.find(function(b) { return b.faceValue === Number(best[0]) && b.quantity <= qty; }) || vb[0] };
+    // Score each bid by probability
+    var scored = vb.map(function(b) {
+      return { bid: b, prob: bidProb(s, b, bot.dice, s.isPal) };
+    });
+    // Target a bid with ~60-80% probability of being true
+    var targetP = 0.7 - diff.bidNoise * 0.3;
+    scored.sort(function(a, b) {
+      return Math.abs(a.prob - targetP) - Math.abs(b.prob - targetP);
+    });
+    // Add noise: pick from top candidates
+    var pool = scored.slice(0, Math.max(1, Math.ceil(diff.bidNoise * 8)));
+    var pick = pool[Math.floor(Math.random() * pool.length)];
+    return { type: 'bid', bid: pick.bid };
   }
+
   if (vb.length === 0) return { type: 'liar' };
+
   if (cb) {
-    const my = countOwn(bot.dice, cb.faceValue, s.isPal);
-    const od = td - bot.diceCount;
-    const prob = s.isPal || cb.faceValue === 1 ? 1 / 6 : 2 / 6;
-    const exp = my + od * prob;
-    if (cb.quantity > exp * 1.3) return { type: 'liar' };
-    if (s.config.mode === 'advanced' && !s.history.some(function(a) { return a.type === 'calza'; }) && cb.playerId !== botId && Math.abs(cb.quantity - exp) < 0.8) {
-      return { type: 'calza' };
+    var pTrue = bidProb(s, cb, bot.dice, s.isPal);
+
+    // Consider CALZA in advanced mode
+    if (s.config.mode === 'advanced' && diff.calzaRange > 0 &&
+        !s.history.some(function(a) { return a.type === 'calza'; }) &&
+        cb.playerId !== botId) {
+      // Calculate exact probability
+      var myMatch = countOwn(bot.dice, cb.faceValue, s.isPal);
+      var needed = cb.quantity - myMatch;
+      var unknown = td - bot.diceCount;
+      var pp = (s.isPal || cb.faceValue === 1) ? 1/6 : 2/6;
+      var pExact = needed >= 0 && needed <= unknown ?
+        Math.exp(logBinom(unknown, needed) + needed * Math.log(pp) + (unknown - needed) * Math.log(1 - pp)) : 0;
+      if (pExact > diff.calzaRange) {
+        return { type: 'calza' };
+      }
     }
+
+    // Call LIAR if probability of bid being true is below threshold
+    if (pTrue < diff.liarThresh) {
+      return { type: 'liar' };
+    }
+
+    // Make a bid - score all valid bids
+    var scored2 = vb.map(function(b) {
+      return { bid: b, prob: bidProb(s, b, bot.dice, s.isPal) };
+    });
+
+    // Expert/skilled: prefer bids with high probability, minimal raise
+    // Rookie: more random, sometimes bluffs wildly
+    if (Math.random() < diff.bluffChance) {
+      // Wild bluff: pick a random bid
+      return { type: 'bid', bid: vb[Math.floor(Math.random() * vb.length)] };
+    }
+
+    // Filter bids with reasonable probability
+    var minP = Math.max(0.15, diff.liarThresh - 0.15);
+    var reasonable = scored2.filter(function(s) { return s.prob >= minP; });
+    if (reasonable.length === 0) reasonable = scored2.slice(0, 5);
+
+    // Sort by: prefer bids that are just above minimum raise, with good probability
+    reasonable.sort(function(a, b) {
+      // Weight: higher probability better, lower quantity better (minimal raise)
+      var scoreA = a.prob * 2 - a.bid.quantity / td;
+      var scoreB = b.prob * 2 - b.bid.quantity / td;
+      return scoreB - scoreA;
+    });
+
+    var topN = Math.max(1, Math.ceil(diff.bidNoise * reasonable.length));
+    var pool2 = reasonable.slice(0, topN);
+    return { type: 'bid', bid: pool2[Math.floor(Math.random() * pool2.length)].bid };
   }
-  const sorted = vb.slice().sort(function(a, b) {
-    const ao = countOwn(bot.dice, a.faceValue, s.isPal);
-    const bo = countOwn(bot.dice, b.faceValue, s.isPal);
-    return bo !== ao ? bo - ao : a.quantity - b.quantity;
-  });
-  const top = sorted.slice(0, 3);
-  return { type: 'bid', bid: top[Math.floor(Math.random() * top.length)] };
+
+  return { type: 'bid', bid: vb[0] };
 }
 
 // ============================================================
@@ -133,7 +226,7 @@ function genCode(len) {
   return code;
 }
 
-function createBotPlayer() {
+function createBotPlayer(difficulty) {
   const idx = botCounter % BOT_NAMES.length;
   botCounter++;
   return {
@@ -144,6 +237,7 @@ function createBotPlayer() {
     isBot: true,
     isReady: true,
     connected: true,
+    difficulty: difficulty || 'regular',
   };
 }
 
@@ -218,7 +312,7 @@ function emitLobby(room) {
     id: room.id, code: room.code, mode: room.mode, host: room.host,
     status: room.status, maxPlayers: room.maxPlayers, isPublic: room.isPublic,
     players: room.players.map(function(p) {
-      return { id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isReady: p.isReady, connected: p.connected };
+      return { id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isReady: p.isReady, connected: p.connected, difficulty: p.difficulty || null };
     }),
   });
 }
@@ -269,7 +363,9 @@ function executeBotTurn(room) {
   if (!gs || gs.phase !== 'bidding') return;
   var bot = gs.players[gs.cpi];
   if (!bot.isBot) return;
-  var act = botDecision(gs, bot.id);
+  var roomBot = room.players.find(function(p) { return p.id === bot.id; });
+  var diff = (roomBot && roomBot.difficulty) || 'regular';
+  var act = botDecision(gs, bot.id, diff);
   doAction(room, bot.id, act.type, act.bid || null);
 }
 
@@ -335,12 +431,23 @@ function resolveReveal(room) {
   var gs = room.gameState;
   if (!gs || gs.phase !== 'revealing') return;
   var r = gs.result;
+  var oldPlayers = gs.players;
   var newPlayers = gs.players.map(function(p) {
     var u = Object.assign({}, p);
     if (r.loserId === p.id) { u.diceCount = Math.max(0, p.diceCount - 1); if (u.diceCount === 0) u.isEliminated = true; }
     if (r.gainId === p.id) u.diceCount = Math.min(gs.config.maxDice, p.diceCount + 1);
     return u;
   });
+  // Track first eliminated player
+  if (!room.firstEliminated) {
+    var justElim = newPlayers.find(function(np) {
+      var op = oldPlayers.find(function(o) { return o.id === np.id; });
+      return np.isEliminated && op && !op.isEliminated;
+    });
+    if (justElim) {
+      room.firstEliminated = justElim.id;
+    }
+  }
   gs = Object.assign({}, gs, { players: newPlayers });
   var rem = actives(gs);
   if (rem.length === 1) {
@@ -349,7 +456,7 @@ function resolveReveal(room) {
     room.gameState = gs;
     room.status = 'finished';
     emitGameState(room);
-    io.to(room.id).emit('gameOver', { winner: rem[0] });
+    io.to(room.id).emit('gameOver', { winner: rem[0], firstEliminated: room.firstEliminated });
     return;
   }
   var ni;
@@ -469,6 +576,35 @@ io.on('connection', function(socket) {
     emitLobby(room);
   });
 
+  socket.on('leaveRoom', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) { players.delete(socket.id); return; }
+    var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    var pName = p ? p.name : 'A player';
+    var pAvatar = p ? p.avatar : '❓';
+    socket.leave(room.id);
+    players.delete(socket.id);
+    io.to(room.id).emit('playerLeft', { name: pName, avatar: pAvatar, playerId: info.playerId });
+    if (room.status === 'lobby' || room.status === 'finished') {
+      room.players = room.players.filter(function(pl) { return pl.id !== info.playerId; });
+    } else if (room.status === 'playing' && p) {
+      p.connected = false;
+    }
+    if (room.players.filter(function(p2) { return !p2.isBot && p2.connected !== false; }).length === 0) {
+      clearTimeout(room.turnTimer);
+      rooms.delete(room.id);
+    } else {
+      if (room.host === info.playerId) {
+        var newHost = room.players.find(function(pl) { return !pl.isBot && pl.connected !== false; });
+        if (newHost) room.host = newHost.id;
+      }
+      emitLobby(room);
+    }
+    socket.emit('leftRoom');
+  });
+
   socket.on('joinRoom', function(data) {
     var found = null;
     rooms.forEach(function(room) {
@@ -502,13 +638,15 @@ io.on('connection', function(socket) {
     emitLobby(room);
   });
 
-  socket.on('addBot', function() {
+  socket.on('addBot', function(data) {
     var info = players.get(socket.id);
     if (!info) return;
     var room = rooms.get(info.roomId);
     if (!room || room.status !== 'lobby' || room.host !== info.playerId) return;
     if (room.players.length >= room.maxPlayers) { socket.emit('actionError', 'Room is full.'); return; }
-    room.players.push(createBotPlayer());
+    var diff = (data && data.difficulty) || 'regular';
+    if (!DIFF_CFG[diff]) diff = 'regular';
+    room.players.push(createBotPlayer(diff));
     emitLobby(room);
   });
 
@@ -528,6 +666,58 @@ io.on('connection', function(socket) {
     if (botIdx !== -1) { room.players.splice(botIdx, 1); emitLobby(room); }
   });
 
+  socket.on('setBotDifficulty', function(data) {
+    var info = players.get(socket.id);
+    if (!info || !data) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby' || room.host !== info.playerId) return;
+    var bot = room.players.find(function(p) { return p.id === data.botId && p.isBot; });
+    if (bot && DIFF_CFG[data.difficulty]) {
+      bot.difficulty = data.difficulty;
+      emitLobby(room);
+    }
+  });
+
+  socket.on('kickPlayer', function(data) {
+    var info = players.get(socket.id);
+    if (!info || !data) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.host !== info.playerId) return;
+    var targetId = data.playerId;
+    if (targetId === info.playerId) return; // Can't kick yourself
+    var target = room.players.find(function(p) { return p.id === targetId; });
+    if (!target) return;
+    if (target.isBot) {
+      // Just remove bots
+      room.players = room.players.filter(function(p) { return p.id !== targetId; });
+    } else {
+      // Kick human player
+      if (target.socketId) {
+        var tSock = io.sockets.sockets.get(target.socketId);
+        if (tSock) {
+          tSock.emit('kicked', { reason: 'Host removed you from the lobby.' });
+          tSock.leave(room.id);
+        }
+        players.delete(target.socketId);
+      }
+      room.players = room.players.filter(function(p) { return p.id !== targetId; });
+    }
+    emitLobby(room);
+  });
+
+  socket.on('endCurrentGame', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.host !== info.playerId) return;
+    if (room.status !== 'playing') return;
+    clearTimeout(room.turnTimer);
+    room.status = 'finished';
+    room.gameState.phase = 'gameOver';
+    room.gameState.winner = null;
+    io.to(room.id).emit('gameCancelled', { reason: 'Host ended the game.' });
+  });
+
   socket.on('toggleReady', function() {
     var info = players.get(socket.id);
     if (!info) return;
@@ -544,6 +734,98 @@ io.on('connection', function(socket) {
     if (!room || room.status !== 'lobby') return;
     if (room.host !== info.playerId) { socket.emit('actionError', 'Only host can start.'); return; }
     if (room.players.length < 2) { socket.emit('actionError', 'Need at least 2 players.'); return; }
+    room.firstEliminated = null;
+    startGame(room);
+    emitLobby(room);
+  });
+
+  socket.on('restartGame', function(data) {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    if (room.host !== info.playerId) { socket.emit('actionError', 'Only host can restart.'); return; }
+    clearTimeout(room.turnTimer);
+
+    // Replace disconnected players with bots
+    var newPlayers = [];
+    room.players.forEach(function(p) {
+      if (!p.isBot && !p.connected) {
+        // Player left — replace with bot at same seat
+        var replacement = createBotPlayer(data && data.botDifficulty || 'regular');
+        replacement.name = p.name + ' (Bot)';
+        newPlayers.push(replacement);
+        if (p.socketId) players.delete(p.socketId);
+      } else {
+        newPlayers.push(p);
+      }
+    });
+    room.players = newPlayers;
+
+    // Optionally shuffle player order
+    if (data && data.randomizeSeats) {
+      for (var i = room.players.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        var temp = room.players[i];
+        room.players[i] = room.players[j];
+        room.players[j] = temp;
+      }
+    }
+    var prevFirstElim = room.firstEliminated;
+    room.firstEliminated = null;
+    // Reset players
+    room.players.forEach(function(p) {
+      p.isReady = true;
+      p.isEliminated = false;
+      if (!p.isBot) p.connected = true;
+    });
+    // Start new game
+    room.status = 'playing';
+    var c = { mode: room.mode, startingDice: 5, turnTimer: 30, maxDice: 5, playerCount: room.players.length };
+    var ps = room.players.map(function(p) {
+      return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: 'default' };
+    });
+    room.gameState = { config: c, players: ps, cpi: 0, currentBid: null, round: 0, phase: 'waiting', isPal: false, palId: null, history: [], result: null, winner: null };
+    var first;
+    if (data && data.firstLoserStarts && prevFirstElim) {
+      first = room.players.findIndex(function(p) { return p.id === prevFirstElim; });
+      if (first === -1) first = Math.floor(Math.random() * room.players.length);
+    } else {
+      first = Math.floor(Math.random() * room.players.length);
+    }
+    room.gameState = startRoundServer(room.gameState, first);
+    io.to(room.id).emit('rematchStarting', { randomized: !!(data && data.randomizeSeats), firstLoserStarts: !!(data && data.firstLoserStarts) });
+    emitGameState(room);
+    startTurnTimer(room);
+    emitLobby(room);
+  });
+
+  socket.on('endLobby', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    if (room.host !== info.playerId) return;
+    clearTimeout(room.turnTimer);
+    io.to(room.id).emit('lobbyEnded');
+    room.players.forEach(function(p) {
+      if (p.socketId) {
+        players.delete(p.socketId);
+        var s = io.sockets.sockets.get(p.socketId);
+        if (s) s.leave(room.id);
+      }
+    });
+    rooms.delete(room.id);
+  });
+
+  socket.on('startGameWithOptions', function() {
+    var info = players.get(socket.id);
+    if (!info) return;
+    var room = rooms.get(info.roomId);
+    if (!room || room.status !== 'lobby') return;
+    if (room.host !== info.playerId) { socket.emit('actionError', 'Only host can start.'); return; }
+    if (room.players.length < 2) { socket.emit('actionError', 'Need at least 2 players.'); return; }
+    room.firstEliminated = null;
     startGame(room);
     emitLobby(room);
   });
@@ -723,8 +1005,12 @@ io.on('connection', function(socket) {
     var room = rooms.get(info.roomId);
     if (!room) return;
     var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    var pName = p ? p.name : 'A player';
+    var pAvatar = p ? p.avatar : '❓';
     if (p) p.connected = false;
     players.delete(socket.id);
+    // Notify remaining players
+    io.to(room.id).emit('playerLeft', { name: pName, avatar: pAvatar, playerId: info.playerId });
     if (room.status === 'lobby') {
       room.players = room.players.filter(function(pl) { return pl.id !== info.playerId; });
       if (room.players.filter(function(p2) { return !p2.isBot; }).length === 0) { rooms.delete(room.id); return; }
@@ -747,6 +1033,11 @@ io.on('connection', function(socket) {
           else doAction(room, pid, 'bid', { quantity: 1, faceValue: 2 });
         }, 10000);
       }
+    }
+    if (room.status === 'finished') {
+      room.players = room.players.filter(function(pl) { return pl.id !== info.playerId; });
+      if (room.players.filter(function(p2) { return !p2.isBot; }).length === 0) { rooms.delete(room.id); }
+      else emitLobby(room);
     }
   });
 
