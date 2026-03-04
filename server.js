@@ -241,7 +241,7 @@ function createBotPlayer(difficulty) {
   };
 }
 
-function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic) {
+function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic, hostTag) {
   const roomId = uuid();
   const code = genCode(6);
   const hostId = uuid();
@@ -251,7 +251,7 @@ function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic
     isPublic: !!isPublic,
     players: [{
       id: hostId, socketId: hostSocket.id, name: hostName || 'Host',
-      avatar: hostAvatar || '😎', isBot: false, isReady: false, connected: true,
+      avatar: hostAvatar || '😎', tag: hostTag || '', isBot: false, isReady: false, connected: true,
     }],
     gameState: null, turnTimer: null, createdAt: Date.now(),
   };
@@ -312,7 +312,7 @@ function emitLobby(room) {
     id: room.id, code: room.code, mode: room.mode, host: room.host,
     status: room.status, maxPlayers: room.maxPlayers, isPublic: room.isPublic,
     players: room.players.map(function(p) {
-      return { id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isReady: p.isReady, connected: p.connected, difficulty: p.difficulty || null };
+      return { id: p.id, name: p.name, avatar: p.avatar, tag: p.tag || '', isBot: p.isBot, isReady: p.isReady, connected: p.connected, difficulty: p.difficulty || null };
     }),
   });
 }
@@ -535,7 +535,7 @@ function tryMatchmake() {
           var memSock = io.sockets.sockets.get(mem.socketId);
           if (!memSock) continue;
           var memId = uuid();
-          room.players.push({ id: memId, socketId: mem.socketId, name: mem.name, avatar: mem.avatar, isBot: false, isReady: true, connected: true });
+          room.players.push({ id: memId, socketId: mem.socketId, name: mem.name, avatar: mem.avatar, tag: mem.tag || '', isBot: false, isReady: true, connected: true });
           players.set(mem.socketId, { roomId: room.id, playerId: memId });
           memSock.join(room.id);
           memSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: memId });
@@ -544,7 +544,7 @@ function tryMatchmake() {
         var pSock = io.sockets.sockets.get(pe.socketId);
         if (!pSock) continue;
         var pid = uuid();
-        room.players.push({ id: pid, socketId: pe.socketId, name: pe.name, avatar: pe.avatar, isBot: false, isReady: true, connected: true });
+        room.players.push({ id: pid, socketId: pe.socketId, name: pe.name, avatar: pe.avatar, tag: pe.tag || '', isBot: false, isReady: true, connected: true });
         players.set(pe.socketId, { roomId: room.id, playerId: pid });
         pSock.join(room.id);
         pSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: pid });
@@ -571,7 +571,7 @@ io.on('connection', function(socket) {
   console.log('Connected: ' + socket.id);
 
   socket.on('createRoom', function(data) {
-    var room = createRoom(socket, data.name, data.avatar, data.mode, data.maxPlayers || 6, false);
+    var room = createRoom(socket, data.name, data.avatar, data.mode, data.maxPlayers || 6, false, data.tag);
     socket.emit('roomCreated', { roomId: room.id, code: room.code, playerId: room.host, maxPlayers: room.maxPlayers });
     emitLobby(room);
   });
@@ -613,7 +613,7 @@ io.on('connection', function(socket) {
     if (!found) { socket.emit('actionError', 'Room not found or game already started.'); return; }
     if (found.players.length >= found.maxPlayers) { socket.emit('actionError', 'Room is full (' + found.maxPlayers + '/' + found.maxPlayers + ').'); return; }
     var playerId = uuid();
-    found.players.push({ id: playerId, socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', isBot: false, isReady: false, connected: true });
+    found.players.push({ id: playerId, socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', tag: data.tag || '', isBot: false, isReady: false, connected: true });
     players.set(socket.id, { roomId: found.id, playerId: playerId });
     socket.join(found.id);
     socket.emit('joinedRoom', { roomId: found.id, code: found.code, playerId: playerId });
@@ -833,7 +833,7 @@ io.on('connection', function(socket) {
   // --- MATCHMAKING ---
   socket.on('searchGame', function(data) {
     removeFromQueue(socket.id);
-    matchQueue.push({ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', mode: data.mode || 'basic', partyMembers: null, joinedAt: Date.now() });
+    matchQueue.push({ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', tag: data.tag || '', mode: data.mode || 'basic', partyMembers: null, joinedAt: Date.now() });
     socket.emit('queueJoined', { position: matchQueue.length });
     tryMatchmake();
   });
