@@ -112,7 +112,7 @@ var DIFF_CFG = {
   rookie:  { liarThresh: 0.20, bidNoise: 0.7, calzaRange: 0,    bluffChance: 0.3  },
   regular: { liarThresh: 0.35, bidNoise: 0.4, calzaRange: 0,    bluffChance: 0.15 },
   skilled: { liarThresh: 0.45, bidNoise: 0.2, calzaRange: 0.12, bluffChance: 0.08 },
-  expert:  { liarThresh: 0.52, bidNoise: 0.05,calzaRange: 0.08, bluffChance: 0.03 },
+  expert:  { liarThresh: 0.58, bidNoise: 0.01,calzaRange: 0.05, bluffChance: 0.005},
 };
 
 function botDecision(s, botId, difficulty) {
@@ -122,31 +122,75 @@ function botDecision(s, botId, difficulty) {
   var cb = s.currentBid;
   var td = totalDice(s);
   var faces = s.isPal && cb ? [cb.faceValue] : [1, 2, 3, 4, 5, 6];
+  var isExpert = difficulty === 'expert';
 
-  // Generate valid bids
+  // Smart quantity caps
+  var maxQForFace = function(fv) {
+    var p = (s.isPal || fv === 1) ? (1/6) : (2/6);
+    return Math.ceil(td * p * 1.5) + 2;
+  };
+  if (cb) {
+    var capChk = maxQForFace(cb.faceValue);
+    if (cb.quantity > capChk + 3) return { type: 'liar' };
+  }
+
+  // Expert: dynamic liar threshold based on game state
+  var effectiveThresh = diff.liarThresh;
+  if (isExpert) {
+    var activePlayers = s.players.filter(function(p) { return !p.isEliminated; }).length;
+    var bidRounds = s.history.filter(function(h) { return h.type === 'bid'; }).length;
+    // More aggressive liar calls when: fewer players, many bid rounds, bot has few dice (less to lose)
+    if (activePlayers <= 2) effectiveThresh += 0.08;
+    if (bidRounds >= activePlayers * 2) effectiveThresh += 0.06;
+    if (bot.diceCount <= 2) effectiveThresh += 0.05;
+    // Less aggressive when bot has lots of dice (more to lose)
+    if (bot.diceCount >= 4) effectiveThresh -= 0.04;
+    effectiveThresh = Math.min(0.75, Math.max(0.4, effectiveThresh));
+  }
+
+  // Generate valid bids with caps
   var vb = [];
   for (var fi = 0; fi < faces.length; fi++) {
-    for (var q = 1; q <= td; q++) {
+    var faceMax = maxQForFace(faces[fi]);
+    for (var q = 1; q <= Math.min(td, faceMax); q++) {
       var b = { playerId: botId, quantity: q, faceValue: faces[fi] };
       if (isValidBid(s, b).ok) vb.push(b);
     }
   }
 
-  // Opening bid (no current bid)
+  // Expert: count own dice per face for hand-aware bidding
+  var myFaceCounts = {};
+  if (bot.dice) {
+    for (var d = 0; d < bot.dice.length; d++) {
+      myFaceCounts[bot.dice[d]] = (myFaceCounts[bot.dice[d]] || 0) + 1;
+    }
+  }
+
+  // Opening bid
   if (!cb && vb.length > 0) {
-    // Score each bid by probability
-    var scored = vb.map(function(b) {
-      return { bid: b, prob: bidProb(s, b, bot.dice, s.isPal) };
-    });
-    // Target a bid with ~60-80% probability of being true
+    if (isExpert && bot.dice) {
+      // Expert opens with their strongest face — the one they have most of
+      var bestFace = 2; var bestCount = 0;
+      for (var fk in myFaceCounts) {
+        var fv = parseInt(fk);
+        // Weight aces higher (they're wild)
+        var effective = myFaceCounts[fk] + (fv === 1 ? 0 : (myFaceCounts[1] || 0));
+        if (effective > bestCount || (effective === bestCount && fv > bestFace)) {
+          bestCount = effective; bestFace = fv;
+        }
+      }
+      // Bid quantity = what bot has + expected from others
+      var othDice = td - bot.diceCount;
+      var pOth = (s.isPal || bestFace === 1) ? 1/6 : 2/6;
+      var expectedOthers = Math.round(othDice * pOth);
+      var openQ = Math.max(1, Math.min(bestCount + Math.floor(expectedOthers * 0.6), maxQForFace(bestFace)));
+      return { type: 'bid', bid: { playerId: botId, quantity: openQ, faceValue: bestFace } };
+    }
+    var scored = vb.map(function(b2) { return { bid: b2, prob: bidProb(s, b2, bot.dice, s.isPal) }; });
     var targetP = 0.7 - diff.bidNoise * 0.3;
-    scored.sort(function(a, b) {
-      return Math.abs(a.prob - targetP) - Math.abs(b.prob - targetP);
-    });
-    // Add noise: pick from top candidates
+    scored.sort(function(a, b2) { return Math.abs(a.prob - targetP) - Math.abs(b2.prob - targetP); });
     var pool = scored.slice(0, Math.max(1, Math.ceil(diff.bidNoise * 8)));
-    var pick = pool[Math.floor(Math.random() * pool.length)];
-    return { type: 'bid', bid: pick.bid };
+    return { type: 'bid', bid: pool[Math.floor(Math.random() * pool.length)].bid };
   }
 
   if (vb.length === 0) return { type: 'liar' };
@@ -154,52 +198,56 @@ function botDecision(s, botId, difficulty) {
   if (cb) {
     var pTrue = bidProb(s, cb, bot.dice, s.isPal);
 
-    // Consider CALZA in advanced mode
+    // CALZA consideration
     if (s.config.mode === 'advanced' && diff.calzaRange > 0 &&
         !s.history.some(function(a) { return a.type === 'calza'; }) &&
         cb.playerId !== botId) {
-      // Calculate exact probability
       var myMatch = countOwn(bot.dice, cb.faceValue, s.isPal);
       var needed = cb.quantity - myMatch;
       var unknown = td - bot.diceCount;
       var pp = (s.isPal || cb.faceValue === 1) ? 1/6 : 2/6;
       var pExact = needed >= 0 && needed <= unknown ?
         Math.exp(logBinom(unknown, needed) + needed * Math.log(pp) + (unknown - needed) * Math.log(1 - pp)) : 0;
-      if (pExact > diff.calzaRange) {
-        return { type: 'calza' };
-      }
+      if (pExact > diff.calzaRange) return { type: 'calza' };
     }
 
-    // Call LIAR if probability of bid being true is below threshold
-    if (pTrue < diff.liarThresh) {
+    // LIAR call
+    if (pTrue < effectiveThresh) return { type: 'liar' };
+
+    // Expert bidding strategy: minimal raise with hand-aware face selection
+    if (isExpert && bot.dice) {
+      // Prefer raising on a face the bot actually holds
+      var bestBid = null; var bestScore = -1;
+      for (var vi = 0; vi < vb.length; vi++) {
+        var vbi = vb[vi];
+        var prob = bidProb(s, vbi, bot.dice, s.isPal);
+        if (prob < effectiveThresh * 0.7) continue; // skip bids we'd call liar on
+        // Score: high probability + prefer faces we hold + prefer minimal quantity increase
+        var holdBonus = (myFaceCounts[vbi.faceValue] || 0) * 0.08;
+        var aceBonus = (vbi.faceValue !== 1 && myFaceCounts[1]) ? myFaceCounts[1] * 0.04 : 0;
+        var minRaiseBonus = cb ? (1 / (1 + Math.abs(vbi.quantity - cb.quantity))) * 0.15 : 0;
+        var score = prob + holdBonus + aceBonus + minRaiseBonus;
+        if (score > bestScore) { bestScore = score; bestBid = vbi; }
+      }
+      if (bestBid) return { type: 'bid', bid: bestBid };
+      // If no good bid found, call liar
       return { type: 'liar' };
     }
 
-    // Make a bid - score all valid bids
-    var scored2 = vb.map(function(b) {
-      return { bid: b, prob: bidProb(s, b, bot.dice, s.isPal) };
-    });
-
-    // Expert/skilled: prefer bids with high probability, minimal raise
-    // Rookie: more random, sometimes bluffs wildly
+    // Bluff (non-expert): capped to reasonable range
     if (Math.random() < diff.bluffChance) {
-      // Wild bluff: pick a random bid
-      return { type: 'bid', bid: vb[Math.floor(Math.random() * vb.length)] };
+      var bluffPool = vb.filter(function(b2) { return b2.quantity <= (cb.quantity + 2); });
+      if (bluffPool.length > 0) return { type: 'bid', bid: bluffPool[Math.floor(Math.random() * bluffPool.length)] };
     }
 
-    // Filter bids with reasonable probability
+    // Standard bid selection
+    var scored2 = vb.map(function(b2) { return { bid: b2, prob: bidProb(s, b2, bot.dice, s.isPal) }; });
     var minP = Math.max(0.15, diff.liarThresh - 0.15);
-    var reasonable = scored2.filter(function(s) { return s.prob >= minP; });
+    var reasonable = scored2.filter(function(s2) { return s2.prob >= minP; });
     if (reasonable.length === 0) reasonable = scored2.slice(0, 5);
-
-    // Sort by: prefer bids that are just above minimum raise, with good probability
-    reasonable.sort(function(a, b) {
-      // Weight: higher probability better, lower quantity better (minimal raise)
-      var scoreA = a.prob * 2 - a.bid.quantity / td;
-      var scoreB = b.prob * 2 - b.bid.quantity / td;
-      return scoreB - scoreA;
+    reasonable.sort(function(a, b2) {
+      return (b2.prob * 2 - b2.bid.quantity / td) - (a.prob * 2 - a.bid.quantity / td);
     });
-
     var topN = Math.max(1, Math.ceil(diff.bidNoise * reasonable.length));
     var pool2 = reasonable.slice(0, topN);
     return { type: 'bid', bid: pool2[Math.floor(Math.random() * pool2.length)].bid };
@@ -241,7 +289,7 @@ function createBotPlayer(difficulty) {
   };
 }
 
-function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic, hostTag) {
+function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic, hostTag, hostCup, hostSkin) {
   const roomId = uuid();
   const code = genCode(6);
   const hostId = uuid();
@@ -251,7 +299,8 @@ function createRoom(hostSocket, hostName, hostAvatar, mode, maxPlayers, isPublic
     isPublic: !!isPublic,
     players: [{
       id: hostId, socketId: hostSocket.id, name: hostName || 'Host',
-      avatar: hostAvatar || '😎', tag: hostTag || '', isBot: false, isReady: false, connected: true,
+      avatar: hostAvatar || '😎', tag: hostTag || '', cupColor: hostCup || 'default', diceSkin: hostSkin || 'default',
+      isBot: false, isReady: false, connected: true,
     }],
     gameState: null, turnTimer: null, createdAt: Date.now(),
   };
@@ -271,7 +320,7 @@ function sanitizeForPlayer(gs, playerId) {
     players: gs.players.map(function(p) {
       return {
         id: p.id, name: p.name, avatar: p.avatar, diceCount: p.diceCount,
-        isBot: p.isBot, isEliminated: p.isEliminated,
+        isBot: p.isBot, isEliminated: p.isEliminated, cupColor: p.cupColor || 'default', diceSkin: p.diceSkin || 'default',
         dice: p.id === playerId ? p.dice : [],
       };
     }),
@@ -287,7 +336,7 @@ function sanitizeRevealed(gs) {
     players: gs.players.map(function(p) {
       return {
         id: p.id, name: p.name, avatar: p.avatar, diceCount: p.diceCount,
-        isBot: p.isBot, isEliminated: p.isEliminated, dice: p.dice,
+        isBot: p.isBot, isEliminated: p.isEliminated, cupColor: p.cupColor || 'default', diceSkin: p.diceSkin || 'default', dice: p.dice,
       };
     }),
   };
@@ -505,7 +554,7 @@ function startGame(room) {
   room.status = 'playing';
   var c = { mode: room.mode, startingDice: 5, turnTimer: 30, maxDice: 5, playerCount: room.players.length };
   var ps = room.players.map(function(p) {
-    return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: 'default' };
+    return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: p.diceSkin || 'default', cupColor: p.cupColor || 'default' };
   });
   room.gameState = { config: c, players: ps, cpi: 0, currentBid: null, round: 0, phase: 'waiting', isPal: false, palId: null, history: [], result: null, winner: null };
   var first = Math.floor(Math.random() * room.players.length);
@@ -565,7 +614,7 @@ function tryMatchmake() {
           var memSock = io.sockets.sockets.get(mem.socketId);
           if (!memSock) continue;
           var memId = uuid();
-          room.players.push({ id: memId, socketId: mem.socketId, name: mem.name, avatar: mem.avatar, tag: mem.tag || '', isBot: false, isReady: true, connected: true });
+          room.players.push({ id: memId, socketId: mem.socketId, name: mem.name, avatar: mem.avatar, tag: mem.tag || '', cupColor: mem.cupColor || 'default', diceSkin: mem.diceSkin || 'default', isBot: false, isReady: true, connected: true });
           players.set(mem.socketId, { roomId: room.id, playerId: memId });
           memSock.join(room.id);
           memSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: memId });
@@ -574,7 +623,7 @@ function tryMatchmake() {
         var pSock = io.sockets.sockets.get(pe.socketId);
         if (!pSock) continue;
         var pid = uuid();
-        room.players.push({ id: pid, socketId: pe.socketId, name: pe.name, avatar: pe.avatar, tag: pe.tag || '', isBot: false, isReady: true, connected: true });
+        room.players.push({ id: pid, socketId: pe.socketId, name: pe.name, avatar: pe.avatar, tag: pe.tag || '', cupColor: pe.cupColor || 'default', diceSkin: pe.diceSkin || 'default', isBot: false, isReady: true, connected: true });
         players.set(pe.socketId, { roomId: room.id, playerId: pid });
         pSock.join(room.id);
         pSock.emit('matchFound', { roomId: room.id, code: room.code, playerId: pid });
@@ -601,7 +650,7 @@ io.on('connection', function(socket) {
   console.log('Connected: ' + socket.id);
 
   socket.on('createRoom', function(data) {
-    var room = createRoom(socket, data.name, data.avatar, data.mode, data.maxPlayers || 6, false, data.tag);
+    var room = createRoom(socket, data.name, data.avatar, data.mode, data.maxPlayers || 6, false, data.tag, data.cupColor, data.diceSkin);
     socket.emit('roomCreated', { roomId: room.id, code: room.code, playerId: room.host, maxPlayers: room.maxPlayers });
     emitLobby(room);
   });
@@ -643,7 +692,7 @@ io.on('connection', function(socket) {
     if (!found) { socket.emit('actionError', 'Room not found or game already started.'); return; }
     if (found.players.length >= found.maxPlayers) { socket.emit('actionError', 'Room is full (' + found.maxPlayers + '/' + found.maxPlayers + ').'); return; }
     var playerId = uuid();
-    found.players.push({ id: playerId, socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', tag: data.tag || '', isBot: false, isReady: false, connected: true });
+    found.players.push({ id: playerId, socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', tag: data.tag || '', cupColor: data.cupColor || 'default', diceSkin: data.diceSkin || 'default', isBot: false, isReady: false, connected: true });
     players.set(socket.id, { roomId: found.id, playerId: playerId });
     socket.join(found.id);
     socket.emit('joinedRoom', { roomId: found.id, code: found.code, playerId: playerId });
@@ -826,7 +875,7 @@ io.on('connection', function(socket) {
     room.status = 'playing';
     var c = { mode: room.mode, startingDice: 5, turnTimer: 30, maxDice: 5, playerCount: room.players.length };
     var ps = room.players.map(function(p) {
-      return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: 'default' };
+      return { id: p.id, name: p.name, diceCount: c.startingDice, dice: [], isBot: p.isBot, isEliminated: false, avatar: p.avatar, diceSkin: p.diceSkin || 'default', cupColor: p.cupColor || 'default' };
     });
     room.gameState = { config: c, players: ps, cpi: 0, currentBid: null, round: 0, phase: 'waiting', isPal: false, palId: null, history: [], result: null, winner: null };
     var first;
@@ -876,7 +925,7 @@ io.on('connection', function(socket) {
   // --- MATCHMAKING ---
   socket.on('searchGame', function(data) {
     removeFromQueue(socket.id);
-    matchQueue.push({ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', tag: data.tag || '', mode: data.mode || 'basic', partyMembers: null, joinedAt: Date.now() });
+    matchQueue.push({ socketId: socket.id, name: data.name || 'Player', avatar: data.avatar || '🎲', tag: data.tag || '', cupColor: data.cupColor || 'default', diceSkin: data.diceSkin || 'default', mode: data.mode || 'basic', partyMembers: null, joinedAt: Date.now() });
     socket.emit('queueJoined', { position: matchQueue.length });
     tryMatchmake();
   });
@@ -980,6 +1029,16 @@ io.on('connection', function(socket) {
     var p = room.players.find(function(pl) { return pl.id === info.playerId; });
     if (!p) return;
     io.to(room.id).emit('chat', { sender: p.name, message: msg, avatar: p.avatar });
+  });
+
+  socket.on('emote', function(data) {
+    var info = players.get(socket.id);
+    if (!info || !data) return;
+    var room = rooms.get(info.roomId);
+    if (!room) return;
+    var p = room.players.find(function(pl) { return pl.id === info.playerId; });
+    if (!p) return;
+    io.to(room.id).emit('emote', { emoteId: data.emoteId, sender: p.name, playerId: info.playerId });
   });
 
   // --- VOICE SIGNALING ---
